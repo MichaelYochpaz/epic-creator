@@ -4,7 +4,7 @@ import io
 import os
 import sys
 import urllib.error
-from http.client import HTTPResponse
+from http.client import BadStatusLine, HTTPResponse, IncompleteRead, RemoteDisconnected
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -439,6 +439,134 @@ class TestSkipIfHasEpicsFlag:
         assert (strategy_dir / "RHAISTRAT-1.md").exists()
         assert not (strategy_dir / "RHAISTRAT-2.md").exists()
         assert not (strategy_dir / "RHAISTRAT-3.md").exists()
+
+    @pytest.mark.parametrize("lookup_result", [
+        pytest.param({"fields": {}}, id="unresolved-type"),
+        pytest.param(urllib.error.HTTPError(
+            "https://jira.example.com/issue/RHAI-100", 403, "Forbidden", {}, None),
+            id="forbidden"),
+        pytest.param(urllib.error.HTTPError(
+            "https://jira.example.com/issue/RHAI-100", 404, "Not Found", {}, None),
+            id="not-found"),
+        pytest.param(urllib.error.URLError("lookup failed"), id="network-error"),
+        pytest.param(TimeoutError("lookup timed out"), id="timeout"),
+        pytest.param(RemoteDisconnected("connection closed"), id="disconnected"),
+        pytest.param(IncompleteRead(b"partial"), id="incomplete-read"),
+        pytest.param(BadStatusLine("invalid status"), id="bad-status-line"),
+        pytest.param(ConnectionResetError("connection reset"), id="connection-reset"),
+        pytest.param(None, id="empty-response"),
+    ])
+    def test_failed_link_lookup_does_not_abort_batch(
+            self, tmp_path, monkeypatch, capsys, lookup_result):
+        monkeypatch.chdir(tmp_path)
+        issues = self._make_issues(4)
+        issues[1]["fields"]["issuelinks"] = [{
+            "type": {"name": "Incorporates"},
+            "outwardIssue": {"key": "RHAI-100"},
+        }]
+        issues[3]["fields"]["issuelinks"] = [{
+            "type": {"name": "Incorporates"},
+            "outwardIssue": {
+                "key": "RHAI-101",
+                "fields": {"issuetype": {"name": "Epic"}},
+            },
+        }]
+
+        ids_file = tmp_path / "ids.txt"
+        with patch("fetch_strategy.require_env", return_value=("s", "u", "t")), \
+             patch("fetch_strategy._search_issues", return_value=issues), \
+             patch("fetch_strategy.get_issue", side_effect=[lookup_result]), \
+             patch("fetch_strategy.api_call_with_retry", return_value={"issues": []}):
+            from fetch_strategy import cmd_fetch
+            cmd_fetch(["some jql", "--ids-file", str(ids_file),
+                       "--skip-if-has-epics"])
+
+        assert ids_file.read_text().splitlines() == ["RHAISTRAT-1", "RHAISTRAT-3"]
+        strategy_dir = tmp_path / "artifacts" / "strat-tasks"
+        assert sorted(path.name for path in strategy_dir.iterdir()) == [
+            "RHAISTRAT-1.md", "RHAISTRAT-3.md",
+        ]
+        stderr = capsys.readouterr().err
+        assert "WARNING: Skipped RHAISTRAT-2: could not check existing epics:" in stderr
+        reason = (str(lookup_result) if isinstance(lookup_result, Exception)
+                  else "Cannot determine issue type for RHAI-100")
+        assert reason in stderr
+        assert "Skipped 1 strategies with existing epics" in stderr
+        assert "Skipped 1 strategies because existing epics could not be checked" in stderr
+        assert "Fetched 2 strategies" in stderr
+
+    @pytest.mark.parametrize("error", [
+        pytest.param(IncompleteRead(b"partial"), id="incomplete-read"),
+        pytest.param(BadStatusLine("invalid status"), id="bad-status-line"),
+    ])
+    def test_failed_parent_check_does_not_abort_batch(
+            self, tmp_path, monkeypatch, capsys, error):
+        monkeypatch.chdir(tmp_path)
+        ids_file = tmp_path / "ids.txt"
+        with patch("fetch_strategy.require_env", return_value=("s", "u", "t")), \
+             patch("fetch_strategy._search_issues", return_value=self._make_issues(3)), \
+             patch("fetch_strategy.api_call_with_retry", side_effect=[
+                 {"issues": []}, error, {"issues": []},
+             ]):
+            from fetch_strategy import cmd_fetch
+            cmd_fetch(["some jql", "--ids-file", str(ids_file),
+                       "--skip-if-has-epics"])
+
+        assert ids_file.read_text().splitlines() == ["RHAISTRAT-1", "RHAISTRAT-3"]
+        strategy_dir = tmp_path / "artifacts" / "strat-tasks"
+        assert sorted(path.name for path in strategy_dir.iterdir()) == [
+            "RHAISTRAT-1.md", "RHAISTRAT-3.md",
+        ]
+        stderr = capsys.readouterr().err
+        assert "WARNING: Skipped RHAISTRAT-2: could not check existing epics:" in stderr
+        assert str(error) in stderr
+        assert "Fetched 2 strategies" in stderr
+
+    @pytest.mark.parametrize("check_results, expected_exit", [
+        pytest.param([
+            urllib.error.URLError("lookup failed"),
+            urllib.error.URLError("lookup failed"),
+        ], 1, id="all-checks-failed"),
+        pytest.param([
+            {"issues": [{"key": "RHAI-100"}]},
+            urllib.error.URLError("lookup failed"),
+        ], 1, id="existing-epics-and-failed-check"),
+        pytest.param([
+            {"issues": [{"key": "RHAI-100"}]},
+            {"issues": [{"key": "RHAI-101"}]},
+        ], 0, id="all-have-epics"),
+        pytest.param([], 0, id="no-matching-strategies"),
+    ])
+    def test_empty_batch_exit_status(
+            self, tmp_path, monkeypatch, capsys, check_results, expected_exit):
+        monkeypatch.chdir(tmp_path)
+        ids_file = tmp_path / "ids.txt"
+        ids_file.write_text("RHAISTRAT-9999\n")
+        with patch("fetch_strategy.require_env", return_value=("s", "u", "t")), \
+             patch("fetch_strategy._search_issues",
+                   return_value=self._make_issues(len(check_results))), \
+             patch("fetch_strategy.api_call_with_retry",
+                   side_effect=check_results):
+            from fetch_strategy import cmd_fetch
+            args = ["some jql", "--ids-file", str(ids_file), "--skip-if-has-epics"]
+            if expected_exit:
+                with pytest.raises(SystemExit) as exc_info:
+                    cmd_fetch(args)
+                assert exc_info.value.code == expected_exit
+            else:
+                cmd_fetch(args)
+
+        assert ids_file.read_text() == ""
+        assert not (tmp_path / "artifacts" / "strat-tasks").exists()
+        stderr = capsys.readouterr().err
+        error_message = "ERROR: No strategies fetched and some existing-epic checks failed"
+        if expected_exit:
+            assert error_message in stderr
+            failed_checks = sum(isinstance(result, Exception) for result in check_results)
+            assert (f"Skipped {failed_checks} strategies because existing epics "
+                    "could not be checked") in stderr
+        else:
+            assert "ERROR:" not in stderr
 
     def test_fetches_all_without_flag(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
